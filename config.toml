@@ -1,0 +1,59 @@
+[global]
+log_level = "info" # Set to "debug" to see more connection details
+
+[[tcp]]
+listen = 8080
+target = "127.0.0.1:8000"
+description = "Single TCP 8080 -> 8000 (no limits)"
+timeout = "10s" # Example timeout
+
+[[tcp]]
+listen = 8090
+target = "127.0.0.1:8003"
+description = "TCP 8090 -> 8003 with max 2 connections"
+timeout = "30s"
+max_connections = 2
+
+[[tcp]]
+listen = "9000-9002"
+target = "127.0.0.1:10000-10002"
+description = "TCP Range 9000-9002 -> 10000-10002 (max 1 per mapping)"
+timeout = "5s"
+max_connections = 1 # Each of the 3 forwarders will allow 1 connection
+
+[[tcp]]
+listen = [5000, 5001]
+target = "127.0.0.1:6000"
+description = "TCP Multi [5000,5001] -> 6000 (unlimited)"
+# No max_connections here, so defaults to 0 (unlimited)
+# No timeout string, so ParsedTimeout will be 0 (no specific DialTimeout, system default)
+
+
+# Example of a rule that might hit parsing errors or be skipped
+[[tcp]]
+listen = "abc" # Invalid listen
+target = "127.0.0.1:7000"
+description = "Invalid Listen Port"
+
+[[tcp]]
+listen = 7070
+target = "127.0.0.1:7001-7002" # Single listen to target range (error in ParseTarget)
+description = "TCP Single to Range (invalid mapping)"
+max_connections = 1
+
+[[udp]]
+listen = 5353
+target = "8.8.8.8:53"
+description = "UDP DNS 5353 -> 8.8.8.8:53 (no limits)"
+
+[[udp]]
+listen = 5355
+target = "1.1.1.1:53" # Different target for variety
+description = "UDP DNS 5355 -> 1.1.1.1:53 with max 10 sessions"
+max_connections = 10
+
+[[udp]]
+listen = [6000, 6001]
+target = "127.0.0.1:6053"
+description = "UDP Multi [6000,6001] -> 6053 (max 5 per mapping)"
+max_connections = 5 # Each of the 2 forwarders will allow 5 sessions
