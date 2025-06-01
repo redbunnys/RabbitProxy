@@ -1,160 +1,81 @@
-# RabbitProxy - TCP/UDP Port Forwarder
+# Standalone Rate Limiting Module (Token Bucket)
 
-## Overview
-
-RabbitProxy is a high-performance, configurable TCP/UDP port forwarding tool written in Go. It allows flexible rule definitions for redirecting network traffic and includes advanced features such as dynamic configuration reloading, structured logging, connection limits, TCP timeouts, and granular bandwidth limiting.
+This Go module provides a token bucket implementation for rate limiting operations. It was originally part of a larger project but has been isolated here for focused study and usage.
 
 ## Features
 
-*   **TCP & UDP Forwarding:** Supports both major transport protocols.
-*   **Flexible Port Mappings:**
-    *   Single port to single port (e.g., `8080` -> `target:80`).
-    *   Port range to port range (e.g., `listen = "1000-1005"` -> `target = "host:2000-2005"`).
-    *   Multiple specific listen ports to a single target (e.g., `listen = [5000, 5001]`).
-*   **TOML Configuration:** Easy-to-understand configuration via a `config.toml` file.
-*   **Dynamic Configuration Reloading:**
-    *   Automatically reloads configuration on SIGHUP signal.
-    *   Automatically reloads configuration when the `config.toml` file is modified (via fsnotify).
-*   **Structured Logging with Zap:**
-    *   High-performance, structured logging.
-    *   Configurable log levels: `debug`, `info`, `warn`, `error`, `fatal`, `panic`.
-    *   Outputs to console.
-    *   Optional: Output to a log file with automatic rotation (via `log_file_path` setting).
-    *   Optional: Syslog integration.
-*   **Resource Management:**
-    *   Per-rule connection limits for TCP (`max_connections`).
-    *   Per-rule active session limits for UDP (`max_connections`).
-    *   Per-rule TCP connection timeouts (`timeout`).
-*   **Bandwidth Limiting (Token Bucket):**
-    *   Per-rule or per-port (for UDP multi-port) bandwidth throttling.
-    *   Separate ingress and egress token buckets for each rule.
-    *   Configurable sustained rate (`rate`) and maximum burst (`burst`).
-    *   Supports units: `K`/`Kbps` (kilobits/sec), `M`/`Mbps` (megabits/sec), `G`/`Gbps` (gigabits/sec), `bps` or plain numbers (bits/sec). "unlimited" is also accepted.
+*   **Token Bucket Algorithm:** Classic and flexible rate limiting.
+*   **Configurable Rate and Burst:** Set sustained rate and maximum burst capacity.
+*   **Dynamic Updates:** Rate and burst can be changed on an existing bucket instance.
+*   **Bandwidth String Parsing:** Utility to convert human-readable bandwidth strings (e.g., "10Mbps", "500K", "1G", "unlimited") into bytes per second.
+*   **Thread-Safe:** The token bucket implementation is safe for concurrent use.
 
-## Installation / Building
+## Package: `ratelimit`
 
-1.  Ensure you have Go installed (version 1.21+ recommended).
-2.  Clone the repository (if applicable) or navigate to the project directory.
-3.  Build the executable:
-    ```bash
-    go build -o rabbitproxy main.go
-    ```
-    (Or simply `go build` if your main package is set up appropriately)
+### `parser.go`
 
-## Configuration (`config.toml`)
+*   `ParseBandwidthString(bwStr string) (float64, error)`:
+    *   Parses strings like "10M" (Mbps), "500K" (Kbps), "1G" (Gbps), "1024bps", or "1024" (plain number for bps).
+    *   Also accepts "unlimited" or "0" for no limit.
+    *   Returns the rate in **Bytes Per Second** (float64).
 
-The application is configured using a `config.toml` file located in the same directory as the executable by default. (Currently, the path "config.toml" is hardcoded).
+### `bucket.go`
 
-### Global Settings
+*   `type TokenBucket`
+    *   The core rate limiter struct.
+*   `NewTokenBucket(rateBPS, burstBPS float64) *TokenBucket`:
+    *   Creates a new token bucket.
+    *   `rateBPS`: Tokens (bytes) to add per second.
+    *   `burstBPS`: Maximum capacity of the bucket in tokens (bytes). Defaults to `rateBPS` if not adequately specified.
+*   `Allow(n int) bool` (aliased as `Consume(n int) bool`):
+    *   Non-blocking. Checks if `n` tokens (bytes) can be consumed.
+    *   Returns `true` and consumes tokens if available, `false` otherwise.
+*   `SetRate(newRateBPS, newBurstBPS float64)`:
+    *   Updates the rate and burst size of an existing bucket.
+*   `CurrentTokens() float64`:
+    *   Returns the current number of available tokens.
+*   `Rate() float64`:
+    *   Returns the current configured rate in BPS.
+*   `Burst() float64`:
+    *   Returns the current configured burst size in BPS.
 
-The `[global]` section defines application-wide settings:
 
-```toml
-[global]
-log_level = "info"      # Logging verbosity: "debug", "info", "warn", "error", "fatal", "panic". Default: "info".
-log_file_path = "/var/log/rabbitproxy/rabbitproxy.log"  # Optional. Path to log file. Enables file logging with rotation.
-# enable_syslog = true  # Currently enabled by default if syslog is accessible. Future: make this a config flag.
+## Basic Usage Example
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+	"ratelimit-module-example/ratelimit" // Assuming go.mod is 'ratelimit-module-example'
+)
+
+func main() {
+	// Example: Rate limit to 100 bytes/sec with a burst of 200 bytes
+	rateBPS, _ := ratelimit.ParseBandwidthString("800bps") // 800 bits/sec = 100 bytes/sec
+	burstBPS := 200.0
+
+	bucket := ratelimit.NewTokenBucket(rateBPS, burstBPS)
+
+	for i := 0; i < 5; i++ {
+		// Try to consume 50 bytes
+		if bucket.Consume(50) {
+			fmt.Printf("[%s] Action %d: Allowed (50 bytes consumed)\n", time.Now().Format("15:04:05.000"), i+1)
+		} else {
+			fmt.Printf("[%s] Action %d: Denied (not enough tokens for 50 bytes)\n", time.Now().Format("15:04:05.000"), i+1)
+		}
+		time.Sleep(200 * time.Millisecond) // Wait a bit before next action
+	}
+
+    // Example of CurrentTokens
+    fmt.Printf("Current tokens after operations: %.2f\n", bucket.CurrentTokens())
+
+    // Example of changing rate
+    newRateBPS, _ := ratelimit.ParseBandwidthString("1.6kbps") // 1600 bits/sec = 200 bytes/sec
+    bucket.SetRate(newRateBPS, 300.0) // New rate, new burst
+    fmt.Printf("Rate updated to %.2f Bps, Burst updated to %.2f Bps\n", bucket.Rate(), bucket.Burst())
+}
 ```
 
-### TCP Forwarding Rules (`[[tcp]]`)
-
-Define TCP forwarding rules in sections starting with `[[tcp]]`.
-
-```toml
-[[tcp]]
-listen = 8080                 # Single listen port
-target = "192.168.1.100:80"   # Single target host and port
-description = "Web server forwarding" # Optional description for logs
-timeout = "60s"               # Optional: TCP connection timeout (e.g., "30s", "1m", "1h"). Default: 30s (as per loader.go).
-max_connections = 100         # Optional: Max concurrent connections for this rule. Default: 0 (unlimited).
-bandwidth = "10M"             # Optional: Sustained rate (10 Mbps). Units: K, M, G, bps. "unlimited" or omit for no limit.
-
-[[tcp]]
-listen = "10000-10005"        # Listen on port range (inclusive)
-target = "10.0.0.2:20000-20005" # Target port range (must match count of listen ports for N:N mapping)
-description = "TCP range forwarding"
-bandwidth = { rate = "50M", burst = "75M" } # Advanced: Rate 50Mbps, Burst 75Mbps
-
-[[tcp]]
-listen = [5000, 5001, 5002]   # Listen on multiple specific ports
-target = "192.168.2.1:9000"   # All map to the same single target
-description = "Multiple ports to single TCP target"
-max_connections = 20
-```
-
-### UDP Forwarding Rules (`[[udp]]`)
-
-Define UDP forwarding rules in sections starting with `[[udp]]`.
-
-```toml
-[[udp]]
-listen = 5353
-target = "8.8.8.8:53"
-description = "DNS forwarding to Google DNS"
-max_connections = 200         # Optional: Max concurrent UDP sessions for this rule. Default: 0 (unlimited).
-bandwidth = "1M"              # Optional: Rule-wide bandwidth limit (1 Mbps).
-
-[[udp]]
-listen = "20000-20005"
-target = "10.1.0.2:30000-30005"
-description = "UDP range forwarding"
-
-[[udp]]
-listen = [7000, 7001, 7002]
-target = "10.1.0.3:8000"
-description = "Multiple UDP ports to single target"
-# Example of per-port bandwidth configuration for a multi-port listen rule:
-# If 'bandwidth' is a list, it defines limits ONLY for the specified ports.
-# Other ports in the 'listen' list for this rule would need a rule-wide bandwidth or would be unlimited.
-# For more clarity, ensure all listened ports are covered or define a separate rule-wide bandwidth.
-bandwidth = [
-  { port = 7000, rate = "500K" },
-  { port = 7001, rate = "1M", burst = "1.2M" },
-  { port = 7002, rate = "unlimited" }  # This specific port will have no limit
-]
-
-[[udp]]
-listen = 7003
-target = "10.1.0.4:8001"
-description = "UDP with advanced rule-wide bandwidth"
-bandwidth = { rate = "5M", burst = "6M" }
-```
-
-**Note on Bandwidth Units:**
-*   `K` or `Kbps`: Kilobits per second (e.g., "500K" = 500 Kbps)
-*   `M` or `Mbps`: Megabits per second (e.g., "10M" = 10 Mbps)
-*   `G` or `Gbps`: Gigabits per second (e.g., "1G" = 1 Gbps)
-*   `bps` or plain numbers: Bits per second (e.g., "1024bps" or "1024" = 1024 bps)
-*   The tool converts these values to Bytes per Second internally for the token bucket.
-*   `burst` is optional. If not specified, it defaults to 1.5 times the `rate` (if rate > 0).
-*   `"unlimited"` or omitting the `bandwidth` key means no rate limiting for that rule/port.
-
-## Running RabbitProxy
-
-1.  Create your `config.toml` file.
-2.  Run the executable:
-    ```bash
-    ./rabbitproxy
-    ```
-    Ensure `config.toml` is in the same directory as the executable.
-
-## Configuration Reloading
-
-*   **SIGHUP:** Send a SIGHUP signal to the RabbitProxy process to trigger a configuration reload.
-    ```bash
-    kill -HUP <pid_of_rabbitproxy>
-    ```
-*   **File Watching:** Modifying and saving the `config.toml` file will automatically trigger a reload.
-
-The application will log the outcome of the reload attempt. Existing connections are generally not dropped for unchanged rules; rules that are removed will have their connections gracefully terminated.
-
-## Error Handling
-
-*   The application logs errors to console (and optionally to file/syslog).
-*   Invalid configuration entries are typically logged at startup or during a reload attempt, and problematic rules may be skipped.
-*   Warnings are issued for potential issues like attempting to use privileged ports (<1024) without sufficient permissions.
-*   TCP connections will attempt to retry connecting to a target if it's initially unavailable (up to 3 times with a 2-second delay by default).
-
----
-
-*Generated by AI Port Forwarder Assistant.*
+This module is intended for educational purposes as a standalone example of a token bucket rate limiter.
