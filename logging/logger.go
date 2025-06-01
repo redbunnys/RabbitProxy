@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"log/syslog" // For standard syslog levels for zapsyslog
+	stdSyslog "log/syslog" // For standard syslog Facility constants
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"go.uber.org/zap/exp/zapsyslog" // For syslog hook
 	"gopkg.in/natefinch/lumberjack.v2" // For file rotation
+
+	zapSyslog "github.com/stephanesan/zap-syslog" // New syslog package
+
 	"rabbitproxy/config" // Assuming this is your module path
 )
 
@@ -17,13 +19,10 @@ var L *zap.Logger // Global logger instance (structured)
 var S *zap.SugaredLogger // Global sugared logger instance for convenience
 
 func init() {
-	// Initialize with a default fallback logger until Init() is called.
-	// This prevents nil pointer dereference if L or S are used before Init.
 	var err error
-	L, err = zap.NewDevelopment(zap.ErrorOutput(zapcore.AddSync(os.Stderr))) // Log internal Zap errors to stderr
+	L, err = zap.NewDevelopment(zap.ErrorOutput(zapcore.AddSync(os.Stderr)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize fallback Zap logger: %v\n", err)
-		// As an absolute fallback, make L a no-op logger
 		L = zap.NewNop()
 	}
 	S = L.Sugar()
@@ -46,8 +45,7 @@ func Init(cfg config.GlobalSettings, enableSyslog bool, logFilePath string) erro
 	case "panic":
 		level = zapcore.PanicLevel
 	default:
-		level = zapcore.InfoLevel // Default level
-		// Use fmt.Fprintf for this pre-initialization warning as the logger isn't fully set up.
+		level = zapcore.InfoLevel
 		fmt.Fprintf(os.Stderr, "Warning: Invalid log_level '%s' in config, defaulting to 'info'.\n", cfg.LogLevel)
 	}
 
@@ -55,82 +53,91 @@ func Init(cfg config.GlobalSettings, enableSyslog bool, logFilePath string) erro
 	consoleEncoderCfg := zap.NewProductionEncoderConfig()
 	consoleEncoderCfg.TimeKey = "timestamp"
 	consoleEncoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
-	consoleEncoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder // e.g., INFO, ERROR
-	consoleEncoderCfg.ConsoleSeparator = " " // Use space as separator for console
+	consoleEncoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+	consoleEncoderCfg.ConsoleSeparator = " "
 	consoleCore := zapcore.NewCore(
 		zapcore.NewConsoleEncoder(consoleEncoderCfg),
-		zapcore.Lock(os.Stdout), // Lock for concurrent writes
+		zapcore.Lock(os.Stdout),
 		level,
 	)
-
 	cores := []zapcore.Core{consoleCore}
-	syslogSuccessfullyInitialized := false
 
-	// --- File Output (Rotated Logs) ---
+	var fileCore zapcore.Core // Declare here to check in final log message
 	if logFilePath != "" {
 		fileWriter := zapcore.AddSync(&lumberjack.Logger{
-			Filename:   logFilePath,
-			MaxSize:    100, // megabytes
-			MaxBackups: 3,
-			MaxAge:     28, // days
-			Compress:   true,
+			Filename:   logFilePath, MaxSize: 100, MaxBackups: 3, MaxAge: 28, Compress: true,
 		})
-		fileEncoderCfg := zap.NewProductionEncoderConfig() // Use Production for structured JSON
+		fileEncoderCfg := zap.NewProductionEncoderConfig()
 		fileEncoderCfg.TimeKey = "timestamp"
 		fileEncoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
 		fileEncoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
-		fileCore := zapcore.NewCore(
-			zapcore.NewJSONEncoder(fileEncoderCfg), // JSON output for files
+		fileCore = zapcore.NewCore(
+			zapcore.NewJSONEncoder(fileEncoderCfg),
 			fileWriter,
 			level,
 		)
 		cores = append(cores, fileCore)
-		// This message will go to console if it's the only core so far, or to the initial fallback logger.
 		fmt.Fprintf(os.Stderr, "Info: Logging to file will be enabled: %s\n", logFilePath)
 	}
 
-    // --- Syslog Output ---
+    // --- Syslog Output using stephanesan/zap-syslog ---
+    var syslogCore zapcore.Core
+    syslogSuccessfullyInitialized := false
     if enableSyslog {
-        // zapsyslog.NewPlayer returns (io.WriteCloser, error)
-        syslogWriter, err := zapsyslog.NewPlayer(
-            zapsyslog.Network(""), // Default to local syslog (UDP usually)
-            zapsyslog.Address(""), // Default to local syslog address
-            syslog.LOG_DAEMON,    // Example facility, could be another like LOG_LOCAL0
-            "rabbitproxy",        // Syslog tag
-        )
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "Error: Failed to connect to syslog: %v. Syslog logging disabled.\n", err)
-        } else {
-            syslogEncoderCfg := zap.NewProductionEncoderConfig()
-            syslogEncoderCfg.TimeKey = "timestamp"
-            syslogEncoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
-            syslogEncoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
+        // Base Zap encoder config for syslog messages
+        syslogEncoderDetails := zap.NewProductionEncoderConfig()
+        syslogEncoderDetails.TimeKey = "timestamp"
+        syslogEncoderDetails.EncodeTime = zapcore.ISO8601TimeEncoder
+        syslogEncoderDetails.EncodeLevel = zapcore.CapitalLevelEncoder
+        // Remove fields that syslog might add itself or that are not standard in RFC5424 via this encoder
+        // For example, logger name if not desired, or customize caller key.
+        // syslogEncoderDetails.CallerKey = "" // Example: disable caller key if syslog adds it
+        // syslogEncoderDetails.NameKey = ""   // Example: disable logger name key
 
-            syslogZapCore := zapcore.NewCore(
-                zapcore.NewJSONEncoder(syslogEncoderCfg), // JSON for syslog is common for structured logging
-                zapcore.AddSync(syslogWriter), // This makes io.WriteCloser a WriteSyncer
-                level, // Zap's level filtering applies before sending to syslog
-            )
-            cores = append(cores, syslogZapCore)
-            syslogSuccessfullyInitialized = true
-            fmt.Fprintf(os.Stderr, "Info: Syslog logging will be enabled.\n")
+        syslogEncCfg := zapSyslog.SyslogEncoderConfig{
+            EncoderConfig: syslogEncoderDetails,
+            Facility:      stdSyslog.LOG_DAEMON, // Example: LOG_DAEMON or LOG_LOCAL0, etc.
+            Hostname:      "",                  // Optional: override hostname, empty uses os.Hostname()
+            PID:           os.Getpid(),
+            App:           "rabbitproxy",       // Application name tag
+        }
+
+        syslogEncoder := zapSyslog.NewSyslogEncoder(syslogEncCfg)
+
+        // Empty network and raddr usually mean local syslog daemon
+        syslogSyncer, err := zapSyslog.NewConnSyncer("", "")
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error: Failed to connect to syslog with stephanesan/zap-syslog: %v. Syslog logging disabled.\n", err)
+        } else {
+            syslogCore = zapcore.NewCore(syslogEncoder, syslogSyncer, level)
+            cores = append(cores, syslogCore)
+            syslogSuccessfullyInitialized = true // Mark success
+            fmt.Fprintf(os.Stderr, "Info: Syslog logging enabled via stephanesan/zap-syslog.\n")
         }
     }
 
-	// Combine cores: console, and optionally file and syslog
 	combinedCore := zapcore.NewTee(cores...)
-
-	// Create the logger with options
-	// AddCallerSkip(1) to make caller point to the actual logging site, not this wrapper.
-	// AddStacktrace for ErrorLevel and above.
 	L = zap.New(combinedCore, zap.AddCaller(), zap.AddCallerSkip(1), zap.AddStacktrace(zapcore.ErrorLevel))
 	S = L.Sugar()
 
-	// Log the final status using the newly configured logger
-	finalLogFilePath := "disabled"
-	if logFilePath != "" {
-		finalLogFilePath = logFilePath
-	}
-	S.Infof("Logger initialized. Effective Level: %s. Syslog Enabled: %t. File Logging: %s", level.String(), syslogSuccessfullyInitialized, finalLogFilePath)
+    finalLogMsgParts := []string{fmt.Sprintf("Logger initialized. Effective Level: %s", level.String())}
+    if logFilePath != "" && fileCore != nil { // Check if fileCore was actually added
+        finalLogMsgParts = append(finalLogMsgParts, fmt.Sprintf("File: %s", logFilePath))
+    } else if logFilePath != "" {
+        finalLogMsgParts = append(finalLogMsgParts, "File: (logging disabled due to error or empty path)")
+    } else {
+        finalLogMsgParts = append(finalLogMsgParts, "File: disabled")
+    }
+
+    if enableSyslog {
+        if syslogSuccessfullyInitialized {
+            finalLogMsgParts = append(finalLogMsgParts, "Syslog: enabled")
+        } else {
+            finalLogMsgParts = append(finalLogMsgParts, "Syslog: failed to initialize")
+        }
+    } else {
+        finalLogMsgParts = append(finalLogMsgParts, "Syslog: disabled")
+    }
+	S.Info(strings.Join(finalLogMsgParts, ". "))
 	return nil
 }
