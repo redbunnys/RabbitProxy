@@ -3,22 +3,25 @@ package forwarder
 import (
 	"fmt"
 	"net"
+	"os"     // Required for os.SyscallError
+	"strings" // Required for strings.Contains
 	"sync"
 	"time"
 
-	"rabbitproxy/config" // For ParsedPort
+	"rabbitproxy/config"
 	"rabbitproxy/logging"
+	"rabbitproxy/ratelimit"
 )
 
-const udpSessionTimeout = 2 * time.Minute // Default timeout for UDP sessions
+const udpSessionTimeoutDefault = 2 * time.Minute
+const udpCopyBufferSize = 4096
 
 type clientSession struct {
-	clientAddr *net.UDPAddr
-	targetConn *net.UDPConn
+	clientAddr   *net.UDPAddr
+	targetConn   *net.UDPConn
 	lastActivity time.Time
 }
 
-// UDPForwarder handles UDP forwarding for a single listen port to a single target port.
 type UDPForwarder struct {
 	ListenHost string
 	ListenPort int
@@ -26,32 +29,32 @@ type UDPForwarder struct {
 	TargetPort int
 	RuleDesc   string
 
-	MaxConnections int // Max active sessions (0 for unlimited)
+	MaxConnections int
 
 	listenerConn *net.UDPConn
 	sessions     map[string]*clientSession
 	sessionsLock sync.Mutex
 	stopChan     chan struct{}
-	timeout      time.Duration // Could be made configurable per rule
+	sessionTimeout time.Duration
+
+	ingressBucket *ratelimit.TokenBucket
+	egressBucket  *ratelimit.TokenBucket
+	bandwidthSettings config.BandwidthSetting
 }
 
-// NewUDPForwarder creates a new UDPForwarder instance.
-func NewUDPForwarder(listenP config.ParsedPort, targetP config.ParsedPort, description string, maxConns int) (*UDPForwarder, error) {
+func NewUDPForwarder(listenP config.ParsedPort, targetP config.ParsedPort, description string, maxConns int, bwSettings config.BandwidthSetting) (*UDPForwarder, error) {
 	if listenP.Port <= 0 || listenP.Port > 65535 {
 		return nil, fmt.Errorf("invalid listen port %d for UDP forwarder (rule: %s)", listenP.Port, description)
 	}
-	if targetP.Port <= 0 || targetP.Port > 65535 {
-		return nil, fmt.Errorf("invalid target port %d for UDP forwarder (rule: %s)", targetP.Port, description)
+	if targetP.Host == "" || targetP.Port <= 0 || targetP.Port > 65535 {
+		return nil, fmt.Errorf("invalid target address '%s:%d' for UDP forwarder (rule: %s)", targetP.Host, targetP.Port, description)
 	}
-	if targetP.Host == "" {
-		return nil, fmt.Errorf("target host cannot be empty for UDP forwarder (rule: %s)", description)
-	}
-	if maxConns < 0 { // Should be normalized by config loader
-		logging.Logger.Warnf("NewUDPForwarder (rule '%s'): received negative maxConns (%d), normalizing to 0 (unlimited).", description, maxConns)
+	if maxConns < 0 {
+		logging.S.Warnf("NewUDPForwarder (rule '%s'): received negative maxConns (%d), normalizing to 0 (unlimited).", description, maxConns)
 		maxConns = 0
 	}
 
-	return &UDPForwarder{
+	fwd := &UDPForwarder{
 		ListenHost:     listenP.Host,
 		ListenPort:     listenP.Port,
 		TargetHost:     targetP.Host,
@@ -60,21 +63,48 @@ func NewUDPForwarder(listenP config.ParsedPort, targetP config.ParsedPort, descr
 		MaxConnections: maxConns,
 		sessions:       make(map[string]*clientSession),
 		stopChan:       make(chan struct{}),
-		timeout:        udpSessionTimeout, // Default for now
-	}, nil
-}
-
-// Start begins listening for UDP packets.
-func (f *UDPForwarder) Start() error {
-	listenAddrStr := fmt.Sprintf("%s:%d", f.ListenHost, f.ListenPort)
-	listenUDPAddr, err := net.ResolveUDPAddr("udp", listenAddrStr)
-	if err != nil {
-		return fmt.Errorf("UDP: [%s] Failed to resolve listen address %s: %w", f.RuleDesc, listenAddrStr, err)
+		sessionTimeout: udpSessionTimeoutDefault,
+		bandwidthSettings: bwSettings,
 	}
 
-	conn, err := net.ListenUDP("udp", listenUDPAddr)
-	if err != nil {
-		return fmt.Errorf("UDP: [%s] Failed to listen on %s: %w", f.RuleDesc, listenAddrStr, err)
+	if bwSettings.IsSet && bwSettings.RateBPS > 0 {
+		fwd.ingressBucket = ratelimit.NewTokenBucket(bwSettings.RateBPS, bwSettings.BurstBPS)
+		fwd.egressBucket = ratelimit.NewTokenBucket(bwSettings.RateBPS, bwSettings.BurstBPS)
+		logging.S.Debugf("UDP: [%s] Initialized token buckets. Rate: %.2f Bps, Burst: %.2f Bps (each direction)", description, bwSettings.RateBPS, bwSettings.BurstBPS)
+	} else if bwSettings.IsSet && bwSettings.RateBPS == 0 {
+		logging.S.Debugf("UDP: [%s] Bandwidth is explicitly set to unlimited.", description)
+	} else {
+		logging.S.Debugf("UDP: [%s] No bandwidth limit configured for this forwarder.", description)
+	}
+	return fwd, nil
+}
+
+func (f *UDPForwarder) Start() error {
+	listenAddrStr := fmt.Sprintf("%s:%d", f.ListenHost, f.ListenPort)
+	listenUDPAddr, errResolve := net.ResolveUDPAddr("udp", listenAddrStr)
+	if errResolve != nil {
+		return fmt.Errorf("UDP: [%s] Failed to resolve listen address %s: %w", f.RuleDesc, listenAddrStr, errResolve)
+	}
+
+	conn, errListen := net.ListenUDP("udp", listenUDPAddr)
+	if errListen != nil {
+		if f.ListenPort < 1024 {
+			if opErr, ok := errListen.(*net.OpError); ok {
+				errMsgLower := strings.ToLower(opErr.Err.Error())
+				isPermissionError := false
+				if sysErr, okSys := opErr.Err.(*os.SyscallError); okSys {
+					if strings.Contains(errMsgLower, "permission denied") || strings.Contains(errMsgLower, "access denied") || sysErr.Err.Error() == "errno 13" {
+						isPermissionError = true
+					}
+				} else if strings.Contains(errMsgLower, "permission denied") || strings.Contains(errMsgLower, "access denied") {
+					isPermissionError = true
+				}
+				if isPermissionError {
+					logging.S.Warnf("UDP: [%s] Permission denied when trying to listen on privileged port %s. Try running with root/administrator privileges or use a port >= 1024.", f.RuleDesc, listenAddrStr)
+				}
+			}
+		}
+		return fmt.Errorf("UDP: [%s] failed to listen on %s: %w", f.RuleDesc, listenAddrStr, errListen)
 	}
 	f.listenerConn = conn
 
@@ -82,33 +112,50 @@ func (f *UDPForwarder) Start() error {
 	if f.MaxConnections > 0 {
 		maxSessStr = fmt.Sprintf("%d", f.MaxConnections)
 	}
-	logging.Logger.Infof("UDP Forwarder: [%s] Listening on %s, forwarding to %s:%d. Max Sessions: %s. Session Timeout: %s",
-		f.RuleDesc, listenAddrStr, f.TargetHost, f.TargetPort, maxSessStr, f.timeout.String())
+	bwLog := "disabled"
+	if f.bandwidthSettings.IsSet {
+		if f.bandwidthSettings.RateBPS > 0 {
+			bwLog = fmt.Sprintf("Rate: %.2f Bps, Burst: %.2f Bps (per direction)", f.bandwidthSettings.RateBPS, f.bandwidthSettings.BurstBPS)
+		} else {
+			bwLog = "unlimited"
+		}
+	}
 
-	go f.cleanupLoop() // Start session cleanup loop
+	logging.S.Infof("UDP Forwarder: [%s] Listening on %s, targetting %s:%d. Max Sessions: %s. Session Timeout: %s. Bandwidth: %s",
+		f.RuleDesc, listenAddrStr, f.TargetHost, f.TargetPort, maxSessStr, f.sessionTimeout.String(), bwLog)
+
+	go f.cleanupLoop()
 	go func() {
-		buffer := make([]byte, 4096) // Adjust buffer size as needed
+		buffer := make([]byte, udpCopyBufferSize)
 		for {
 			select {
 			case <-f.stopChan:
 				return
 			default:
-				// Set a read deadline to allow checking stopChan periodically
-				f.listenerConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-				n, clientAddr, err := f.listenerConn.ReadFromUDP(buffer)
-				if err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue // Deadline reached, loop to check stopChan
-					}
-					// Check if error is due to closed connection
-					if err.Error() == "use of closed network connection" || err.Error() == "read udp: use of closed network connection" {
-						logging.Logger.Infof("UDP Listener for rule '%s' on %s closed.", f.RuleDesc, f.listenerConn.LocalAddr())
-						return
-					}
-					logging.Logger.Errorf("UDP: [%s] Error reading from listener: %v", f.RuleDesc, err)
-					continue // Consider if this type of error should stop the listener
+			}
+
+			f.listenerConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			n, clientAddr, readErr := f.listenerConn.ReadFromUDP(buffer)
+
+			if readErr != nil {
+				if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+					continue
 				}
-				// Ensure data is copied before passing buffer to another goroutine or reusing
+				// Use strings.Contains for broader compatibility with "use of closed network connection"
+				if strings.Contains(readErr.Error(), "use of closed network connection") {
+					logging.S.Infof("UDP Listener for rule '%s' on %s closed.", f.RuleDesc, f.listenerConn.LocalAddr())
+					return
+				}
+				logging.S.Warnf("UDP: [%s] Error reading from listener: %v", f.RuleDesc, readErr)
+				continue
+			}
+
+			if n > 0 {
+				if f.ingressBucket != nil && !f.ingressBucket.Consume(n) {
+					logging.S.Debugf("UDP: [%s] Ingress rate limit exceeded for client %s. Dropping %d bytes.", f.RuleDesc, clientAddr.String(), n)
+					continue
+				}
+
 				data := make([]byte, n)
 				copy(data, buffer[:n])
 				go f.handleClientPacket(clientAddr, data)
@@ -118,7 +165,6 @@ func (f *UDPForwarder) Start() error {
 	return nil
 }
 
-// handleClientPacket processes an incoming packet from a client.
 func (f *UDPForwarder) handleClientPacket(clientAddr *net.UDPAddr, data []byte) {
 	clientKey := clientAddr.String()
 	f.sessionsLock.Lock()
@@ -127,23 +173,23 @@ func (f *UDPForwarder) handleClientPacket(clientAddr *net.UDPAddr, data []byte) 
 	if !found {
 		if f.MaxConnections > 0 && len(f.sessions) >= f.MaxConnections {
 			f.sessionsLock.Unlock()
-			logging.Logger.Warnf("UDP: [%s] Max active sessions (%d) reached. Dropping packet from %s (%d bytes). Current sessions: %d",
-				f.RuleDesc, f.MaxConnections, clientAddr, len(data), len(f.sessions)) // len(f.sessions) might be slightly off due to no lock, but ok for log.
+			logging.S.Warnf("UDP: [%s] Max active sessions (%d) reached. Dropping %d byte packet from %s. Current sessions: %d",
+				f.RuleDesc, f.MaxConnections, len(data), clientAddr, len(f.sessions))
 			return
 		}
 
 		targetUDPAddrStr := fmt.Sprintf("%s:%d", f.TargetHost, f.TargetPort)
-		targetUDPAddr, err := net.ResolveUDPAddr("udp", targetUDPAddrStr)
-		if err != nil {
+		targetUDPAddr, errResolve := net.ResolveUDPAddr("udp", targetUDPAddrStr)
+		if errResolve != nil {
 			f.sessionsLock.Unlock()
-			logging.Logger.Errorf("UDP: [%s] Failed to resolve target %s: %v", f.RuleDesc, targetUDPAddrStr, err)
+			logging.S.Errorf("UDP: [%s] Failed to resolve target %s for client %s: %v", f.RuleDesc, targetUDPAddrStr, clientAddr, errResolve)
 			return
 		}
 
-		targetConn, err := net.DialUDP("udp", nil, targetUDPAddr) // Can also use f.listenerConn.WriteToUDP if no specific source port needed for target comms
-		if err != nil {
+		targetConn, errDial := net.DialUDP("udp", nil, targetUDPAddr)
+		if errDial != nil {
 			f.sessionsLock.Unlock()
-			logging.Logger.Errorf("UDP: [%s] Failed to dial target %s: %v", f.RuleDesc, targetUDPAddrStr, err)
+			logging.S.Errorf("UDP: [%s] Failed to dial target %s for client %s: %v", f.RuleDesc, targetUDPAddrStr, clientAddr, errDial)
 			return
 		}
 
@@ -153,109 +199,129 @@ func (f *UDPForwarder) handleClientPacket(clientAddr *net.UDPAddr, data []byte) 
 			lastActivity: time.Now(),
 		}
 		f.sessions[clientKey] = session
-		logging.Logger.Infof("UDP: [%s] New session for %s, forwarding to %s. Active sessions: %d",
+		logging.S.Infof("UDP: [%s] New session for %s -> %s. Active sessions: %d",
 			f.RuleDesc, clientAddr, targetConn.RemoteAddr(), len(f.sessions))
 
-		// Start a goroutine to listen for responses from the target for this session
 		go f.listenFromTarget(session)
 	}
 	session.lastActivity = time.Now()
-	f.sessionsLock.Unlock() // Unlock before writing to target or reading from client
+	f.sessionsLock.Unlock()
 
-	_, err := session.targetConn.Write(data)
-	if err != nil {
-		logging.Logger.Warnf("UDP: [%s] Failed to write to target %s for client %s: %v",
-			f.RuleDesc, session.targetConn.RemoteAddr(), clientAddr, err)
-		// Optionally, remove session if write fails consistently
+	_, errWrite := session.targetConn.Write(data)
+	if errWrite != nil {
+		logging.S.Warnf("UDP: [%s] Failed to write %d bytes to target %s for client %s: %v",
+			f.RuleDesc, len(data), session.targetConn.RemoteAddr(), clientAddr, errWrite)
+	} else {
+		logging.S.Debugf("UDP: [%s] Forwarded %d bytes from %s to %s", f.RuleDesc, len(data), clientAddr, session.targetConn.RemoteAddr())
 	}
 }
 
-// listenFromTarget reads packets from the target and forwards them to the client.
 func (f *UDPForwarder) listenFromTarget(s *clientSession) {
-	buffer := make([]byte, 4096) // Adjust buffer size
+	buffer := make([]byte, udpCopyBufferSize)
 	defer func() {
-		// This defer does not remove the session from the map. That's handled by cleanupLoop.
-		// However, closing the targetConn here is important.
 		s.targetConn.Close()
-		// Logging for when this specific goroutine ends.
-		// logging.Logger.Debugf("UDP: [%s] Goroutine listening from target %s for client %s ended.", f.RuleDesc, s.targetConn.RemoteAddr(), s.clientAddr)
+		logging.S.Debugf("UDP: [%s] Goroutine listening from target %s for client %s ended.", f.RuleDesc, s.targetConn.RemoteAddr(), s.clientAddr)
 	}()
 
 	for {
 		select {
-		case <-f.stopChan: // Forwarder is stopping
+		case <-f.stopChan:
 			return
 		default:
-			// Set a read deadline to allow checking stopChan periodically and session timeout
-			s.targetConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, _, err := s.targetConn.ReadFromUDP(buffer) // We don't care about target's remote addr here
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					// Check for session inactivity inside the timeout block
-					f.sessionsLock.Lock()
-					if time.Since(s.lastActivity) > f.timeout {
-						// Session has timed out, clean it up
-						// Note: actual removal from map is by cleanupLoop, but we can stop this goroutine.
-						logging.Logger.Infof("UDP: [%s] Session for client %s timed out. Closing target connection.", f.RuleDesc, s.clientAddr)
+		}
+
+		s.targetConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, _, readErr := s.targetConn.ReadFromUDP(buffer)
+
+		if readErr != nil {
+			if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+				f.sessionsLock.Lock()
+				sessionStillExists := false
+				if currentSession, exists := f.sessions[s.clientAddr.String()]; exists && currentSession == s {
+					sessionStillExists = true
+					if time.Since(s.lastActivity) > f.sessionTimeout {
+						logging.S.Infof("UDP: [%s] Session for client %s (target %s) inactive for %v, stopping listener. Will be cleaned up.",
+							f.RuleDesc, s.clientAddr, s.targetConn.RemoteAddr(), f.sessionTimeout)
 						f.sessionsLock.Unlock()
-						return // Exit goroutine, session will be removed by cleanupLoop
+						return
 					}
-					f.sessionsLock.Unlock()
-					continue // Deadline reached, loop to check stopChan/activity
 				}
-				// Check if error is due to closed connection (e.g. by Stop() or cleanup)
-				if err.Error() == "use of closed network connection" ||  err.Error() == "read udp: use of closed network connection"{
-					// logging.Logger.Debugf("UDP: [%s] Target connection for client %s closed (likely by cleanup or stop).", f.RuleDesc, s.clientAddr)
+				if !sessionStillExists {
+					logging.S.Debugf("UDP: [%s] Session for client %s (target %s) already removed by cleanup. Stopping listener.", f.RuleDesc, s.clientAddr, s.targetConn.RemoteAddr())
+					f.sessionsLock.Unlock()
 					return
 				}
-				logging.Logger.Warnf("UDP: [%s] Error reading from target %s for client %s: %v", f.RuleDesc, s.targetConn.RemoteAddr(), s.clientAddr, err)
-				return // Exit goroutine on other errors
+				f.sessionsLock.Unlock()
+				continue
+			}
+			if strings.Contains(readErr.Error(), "use of closed network connection") {
+				logging.S.Debugf("UDP: [%s] Target connection for client %s closed (likely by Stop() or cleanup).", f.RuleDesc, s.clientAddr)
+				return
+			}
+			logging.S.Warnf("UDP: [%s] Error reading from target %s for client %s: %v", f.RuleDesc, s.targetConn.RemoteAddr(), s.clientAddr, readErr)
+			return
+		}
+
+		if n > 0 {
+			if f.egressBucket != nil && !f.egressBucket.Consume(n) {
+				logging.S.Debugf("UDP: [%s] Egress rate limit exceeded for target %s to client %s. Dropping %d bytes.", f.RuleDesc, s.targetConn.RemoteAddr(), s.clientAddr, n)
+				continue
 			}
 
-			// Send data back to the original client via the main listener connection
-			_, err = f.listenerConn.WriteToUDP(buffer[:n], s.clientAddr)
-			if err != nil {
-				logging.Logger.Warnf("UDP: [%s] Failed to write to client %s from target %s: %v", f.RuleDesc, s.clientAddr, s.targetConn.RemoteAddr(), err)
-				// If we can't write to client, the session might be effectively dead.
+			_, writeErr := f.listenerConn.WriteToUDP(buffer[:n], s.clientAddr)
+			if writeErr != nil {
+				logging.S.Warnf("UDP: [%s] Failed to write %d bytes to client %s from target %s: %v", f.RuleDesc, n, s.clientAddr, s.targetConn.RemoteAddr(), writeErr)
 			} else {
-				// Update last activity on successful write to client
+				logging.S.Debugf("UDP: [%s] Relayed %d bytes from target %s to client %s", f.RuleDesc, n, s.targetConn.RemoteAddr(), s.clientAddr)
 				f.sessionsLock.Lock()
-				s.lastActivity = time.Now() // Should this be only on client packet? Or any activity?
+				s.lastActivity = time.Now()
 				f.sessionsLock.Unlock()
 			}
 		}
 	}
 }
 
-// cleanupLoop periodically checks for and removes timed-out sessions.
 func (f *UDPForwarder) cleanupLoop() {
-	ticker := time.NewTicker(f.timeout / 2) // Check more frequently than timeout
+	tickerInterval := f.sessionTimeout / 2
+	if tickerInterval < 1*time.Second { // Ensure ticker interval is reasonable
+		tickerInterval = 1*time.Second
+	}
+	if f.sessionTimeout == 0 { // If session timeout is disabled (0), effectively disable cleanup loop by using a very long interval
+		tickerInterval = 24 * time.Hour
+	}
+	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			if f.sessionTimeout == 0 { continue } // Skip cleanup if session timeout is disabled
+
 			f.sessionsLock.Lock()
 			now := time.Now()
+			cleanedCount := 0
 			for key, session := range f.sessions {
-				if now.Sub(session.lastActivity) > f.timeout {
-					logging.Logger.Infof("UDP: [%s] Cleaning up timed-out session for client %s (target %s). Last activity: %s",
-						f.RuleDesc, session.clientAddr, session.targetConn.RemoteAddr(), session.lastActivity.Format(time.RFC3339))
-					session.targetConn.Close() // Close the connection to the target
+				if now.Sub(session.lastActivity) > f.sessionTimeout {
+					logging.S.Infof("UDP: [%s] Cleaning up timed-out session for client %s (target %s). Last activity: %s. Active sessions before cleanup: %d",
+						f.RuleDesc, session.clientAddr, session.targetConn.RemoteAddr(), session.lastActivity.Format(time.RFC3339), len(f.sessions))
+					session.targetConn.Close()
 					delete(f.sessions, key)
+					cleanedCount++
 				}
+			}
+			if cleanedCount > 0 {
+				logging.S.Infof("UDP: [%s] Cleaned up %d timed-out session(s). Active sessions: %d", f.RuleDesc, cleanedCount, len(f.sessions))
 			}
 			f.sessionsLock.Unlock()
 		case <-f.stopChan:
-			return // Forwarder is stopping
+			return
 		}
 	}
 }
 
-// Stop closes the listener and cleans up resources.
 func (f *UDPForwarder) Stop() error {
-	logging.Logger.Infof("Stopping UDP forwarder for rule '%s' (listening on %s:%d)", f.RuleDesc, f.ListenHost, f.ListenPort)
-	close(f.stopChan) // Signal all goroutines to stop
+	logging.S.Infof("Stopping UDP forwarder for rule '%s' (listening on %s:%d)", f.RuleDesc, f.ListenHost, f.ListenPort)
+	close(f.stopChan)
 
 	var err error
 	if f.listenerConn != nil {
@@ -265,10 +331,13 @@ func (f *UDPForwarder) Stop() error {
 
 	f.sessionsLock.Lock()
 	defer f.sessionsLock.Unlock()
-	for key, session := range f.sessions {
-		session.targetConn.Close()
-		delete(f.sessions, key)
+	if len(f.sessions) > 0 {
+		logging.S.Debugf("UDP: [%s] Closing %d active session(s) due to stop.", f.RuleDesc, len(f.sessions))
+		for key, session := range f.sessions {
+			session.targetConn.Close()
+			delete(f.sessions, key)
+		}
 	}
-	logging.Logger.Infof("Successfully stopped UDP forwarder for rule '%s'. All sessions closed.", f.RuleDesc)
+	logging.S.Infof("Successfully stopped UDP forwarder for rule '%s'. All sessions closed.", f.RuleDesc)
 	return err
 }

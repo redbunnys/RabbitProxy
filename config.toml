@@ -1,59 +1,74 @@
 [global]
-log_level = "info" # Set to "debug" to see more connection details
+log_level = "info" # debug, info, warn, error
+log_file_path = "/tmp/rabbitproxy.log" # Optional: Path to log file
 
 [[tcp]]
 listen = 8080
 target = "127.0.0.1:8000"
-description = "Single TCP 8080 -> 8000 (no limits)"
-timeout = "10s" # Example timeout
+description = "TCP 8080 -> 8000 (10M rate, 15M burst)"
+timeout = "10s"
+max_connections = 100
+bandwidth = { rate = "10M", burst = "15M" }
 
 [[tcp]]
-listen = 8090
-target = "127.0.0.1:8003"
-description = "TCP 8090 -> 8003 with max 2 connections"
-timeout = "30s"
-max_connections = 2
+listen = 8081
+target = "127.0.0.1:8001"
+description = "TCP 8081 -> 8001 (500k rate, default burst)"
+timeout = "5s"
+bandwidth = "500k"
 
 [[tcp]]
 listen = "9000-9002"
-target = "127.0.0.1:10000-10002"
-description = "TCP Range 9000-9002 -> 10000-10002 (max 1 per mapping)"
-timeout = "5s"
-max_connections = 1 # Each of the 3 forwarders will allow 1 connection
-
-[[tcp]]
-listen = [5000, 5001]
-target = "127.0.0.1:6000"
-description = "TCP Multi [5000,5001] -> 6000 (unlimited)"
-# No max_connections here, so defaults to 0 (unlimited)
-# No timeout string, so ParsedTimeout will be 0 (no specific DialTimeout, system default)
-
-
-# Example of a rule that might hit parsing errors or be skipped
-[[tcp]]
-listen = "abc" # Invalid listen
-target = "127.0.0.1:7000"
-description = "Invalid Listen Port"
-
-[[tcp]]
-listen = 7070
-target = "127.0.0.1:7001-7002" # Single listen to target range (error in ParseTarget)
-description = "TCP Single to Range (invalid mapping)"
-max_connections = 1
+target = "10.0.0.2:10000-10002"
+description = "TCP Range (unlimited bandwidth)"
+timeout = "60s"
+max_connections = 5 # Per mapped port
+# Bandwidth field omitted - should be unlimited
 
 [[udp]]
 listen = 5353
 target = "8.8.8.8:53"
-description = "UDP DNS 5353 -> 8.8.8.8:53 (no limits)"
+description = "UDP DNS main (rule-wide 1M rate)"
+max_connections = 200
+bandwidth = "1M"
 
 [[udp]]
-listen = 5355
-target = "1.1.1.1:53" # Different target for variety
-description = "UDP DNS 5355 -> 1.1.1.1:53 with max 10 sessions"
-max_connections = 10
+listen = [7000, 7001, 7002]
+target = "192.168.3.1:9000" # All map to same target port
+description = "UDP Multi-port with per-port bandwidth"
+# If ParsedRuleBandwidth is desired for ports not in the list below,
+# it should be defined separately or this rule split.
+# Current logic: if 'bandwidth' is a list, it's only for those specific ports.
+bandwidth = [
+  { port = 7000, rate = "2M", burst = "2.5M" },
+  { port = 7001, rate = "500k" }, # Default burst will apply (0.75M)
+  { port = 7002, rate = "unlimited" } # Explicitly unlimited for this port
+]
 
 [[udp]]
-listen = [6000, 6001]
-target = "127.0.0.1:6053"
-description = "UDP Multi [6000,6001] -> 6053 (max 5 per mapping)"
-max_connections = 5 # Each of the 2 forwarders will allow 5 sessions
+listen = 8000
+target = "1.1.1.1:53"
+description = "UDP to 1.1.1.1 (advanced rule-wide bandwidth)"
+bandwidth = { rate = "5M", burst = "5M" } # Burst equal to rate
+
+# Example of a rule that will be skipped due to parsing errors in bandwidth
+[[tcp]]
+listen = 6060
+target = "127.0.0.1:6001"
+description = "TCP with invalid bandwidth string"
+bandwidth = "10Z" # Invalid unit
+
+[[tcp]]
+listen = 6061
+target = "127.0.0.1:6002"
+description = "TCP with invalid bandwidth map"
+bandwidth = { rates = "10M" } # Misspelled key 'rates' instead of 'rate'
+
+[[udp]]
+listen = [9998, 9999]
+target = "127.0.0.1:10000"
+description = "UDP with invalid per-port bandwidth list"
+bandwidth = [
+  { port = 9998, rate = "1M" },
+  { port_typo = 9999, rate = "2M" } # 'port_typo' instead of 'port'
+]

@@ -4,182 +4,349 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os" // Required for os.SyscallError
+	"strings" // Required for strings.Contains
+	"sync/atomic"
+	"time"
+
 	"rabbitproxy/config"
 	"rabbitproxy/logging"
-	"strings"
-	"sync/atomic" // For atomic operations on activeConnections
-	"time"        // For ParsedTimeout
+	"rabbitproxy/ratelimit"
 )
 
-// TCPForwarder handles TCP forwarding for a single listen port to a single target port.
+const copyBufferSize = 32 * 1024
+const bucketRetryDelay = 5 * time.Millisecond
+const maxDialRetries = 3
+const dialRetryDelay = 2 * time.Second
+const dialAttemptTimeout = 5 * time.Second // Timeout for each individual dial attempt
+
+// Custom error type for context deadline exceeded simulation in customCopyWithRateLimit
+type contextDeadlineExceededError struct{}
+func (e contextDeadlineExceededError) Error() string { return "context deadline exceeded (simulated for bucket wait)" }
+func (e contextDeadlineExceededError) Timeout() bool   { return true }
+func (e contextDeadlineExceededError) Temporary() bool { return false }
+
+
 type TCPForwarder struct {
-	ListenHost string // Specific host this forwarder listens on (usually empty for all interfaces)
-	ListenPort int    // Specific port this forwarder listens on
+	ListenHost        string
+	ListenPort        int
+	TargetHost        string
+	TargetPort        int
+	RuleDesc          string
+	Timeout           time.Duration
+	MaxConnections    int
+	activeConnections int64
+	listener          net.Listener
 
-	TargetHost string // Target host
-	TargetPort int    // Target port
-
-	RuleDesc          string        // From rule.Description for logging
-	Timeout           time.Duration // From rule.ParsedTimeout
-	listener          net.Listener  // Active listener for this forwarder
-	MaxConnections    int           // From rule.MaxConnections (0 means unlimited)
-	activeConnections int64         // Current number of active connections
+	ingressBucket     *ratelimit.TokenBucket
+	egressBucket      *ratelimit.TokenBucket
+	bandwidthSettings config.BandwidthSetting
 }
 
-// NewTCPForwarder creates a new TCPForwarder instance for a specific listen/target pair.
-func NewTCPForwarder(listenP config.ParsedPort, targetP config.ParsedPort, description string, timeout time.Duration, maxConns int) (*TCPForwarder, error) {
+func NewTCPForwarder(listenP config.ParsedPort, targetP config.ParsedPort, description string, timeout time.Duration, maxConns int, bwSettings config.BandwidthSetting) (*TCPForwarder, error) {
 	if listenP.Port <= 0 || listenP.Port > 65535 {
 		return nil, fmt.Errorf("invalid listen port %d for TCP forwarder (rule: %s)", listenP.Port, description)
 	}
 	if targetP.Port <= 0 || targetP.Port > 65535 {
 		return nil, fmt.Errorf("invalid target port %d for TCP forwarder (rule: %s)", targetP.Port, description)
 	}
-	if strings.TrimSpace(targetP.Host) == "" {
+	if targetP.Host == "" {
 		return nil, fmt.Errorf("target host cannot be empty for TCP forwarder (rule: %s)", description)
 	}
-	if maxConns < 0 { // Should be normalized by loader, but safeguard here.
-		logging.Logger.Warnf("NewTCPForwarder (rule '%s'): received negative maxConns (%d), normalizing to 0 (unlimited).", description, maxConns)
+	if maxConns < 0 {
+		logging.S.Warnf("NewTCPForwarder (rule '%s'): received negative maxConns (%d), normalizing to 0 (unlimited).", description, maxConns)
 		maxConns = 0
 	}
 
-	return &TCPForwarder{
-		ListenHost:     listenP.Host,
-		ListenPort:     listenP.Port,
-		TargetHost:     strings.TrimSpace(targetP.Host),
-		TargetPort:     targetP.Port,
-		RuleDesc:       description,
-		Timeout:        timeout,
-		MaxConnections: maxConns,
-		// activeConnections will default to 0
-	}, nil
+	fwd := &TCPForwarder{
+		ListenHost:        listenP.Host,
+		ListenPort:        listenP.Port,
+		TargetHost:        targetP.Host,
+		TargetPort:        targetP.Port,
+		RuleDesc:          description,
+		Timeout:           timeout,
+		MaxConnections:    maxConns,
+		bandwidthSettings: bwSettings,
+	}
+
+	if bwSettings.IsSet && bwSettings.RateBPS > 0 {
+		fwd.ingressBucket = ratelimit.NewTokenBucket(bwSettings.RateBPS, bwSettings.BurstBPS)
+		fwd.egressBucket = ratelimit.NewTokenBucket(bwSettings.RateBPS, bwSettings.BurstBPS)
+		logging.S.Debugf("TCP: [%s] Initialized token buckets. Rate: %.2f Bps, Burst: %.2f Bps (each direction)", description, bwSettings.RateBPS, bwSettings.BurstBPS)
+	} else if bwSettings.IsSet && bwSettings.RateBPS == 0 {
+		logging.S.Debugf("TCP: [%s] Bandwidth is explicitly set to unlimited.", description)
+	} else {
+		logging.S.Debugf("TCP: [%s] No bandwidth limit configured.", description)
+	}
+	return fwd, nil
 }
 
-// Start begins listening and forwarding connections.
 func (f *TCPForwarder) Start() error {
-	listenAddr := fmt.Sprintf("%s:%d", f.ListenHost, f.ListenPort)
-	targetAddr := fmt.Sprintf("%s:%d", f.TargetHost, f.TargetPort) // For logging, not used directly in handleTCPConnection's signature anymore
-
-	listener, err := net.Listen("tcp", listenAddr)
+	listenAddrStr := fmt.Sprintf("%s:%d", f.ListenHost, f.ListenPort)
+	listener, err := net.Listen("tcp", listenAddrStr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s for rule '%s' (target %s): %w", listenAddr, f.RuleDesc, targetAddr, err)
+		if f.ListenPort < 1024 {
+			if opErr, ok := err.(*net.OpError); ok {
+				errMsgLower := strings.ToLower(opErr.Err.Error())
+				isPermissionError := false
+				if sysErr, okSys := opErr.Err.(*os.SyscallError); okSys {
+					// syscall.EACCES is 13 on many Unix-like systems
+					// This check is more robust if syscall.EACCES can be directly used,
+					// but string matching is a common fallback for broader compatibility.
+					if strings.Contains(errMsgLower, "permission denied") || strings.Contains(errMsgLower, "access denied") || sysErr.Err.Error() == "errno 13" {
+						isPermissionError = true
+					}
+				} else if strings.Contains(errMsgLower, "permission denied") || strings.Contains(errMsgLower, "access denied") {
+					isPermissionError = true
+				}
+				if isPermissionError {
+					logging.S.Warnf("TCP: [%s] Permission denied when trying to listen on privileged port %s. Try running with root/administrator privileges or use a port >= 1024.", f.RuleDesc, listenAddrStr)
+				}
+			}
+		}
+		return fmt.Errorf("TCP: [%s] failed to listen on %s: %w", f.RuleDesc, listenAddrStr, err)
 	}
 	f.listener = listener
+
+	rateLimitLog := "disabled"
+	if f.bandwidthSettings.IsSet {
+		if f.bandwidthSettings.RateBPS > 0 {
+			rateLimitLog = fmt.Sprintf("Rate: %.2f Bps, Burst: %.2f Bps (per direction)", f.bandwidthSettings.RateBPS, f.bandwidthSettings.BurstBPS)
+		} else {
+			rateLimitLog = "unlimited"
+		}
+	}
+	logging.S.Infof("TCP Forwarder: [%s] Listening on %s, forwarding to %s:%d. MaxConns: %d, Timeout: %s, Bandwidth: %s",
+		f.RuleDesc, listenAddrStr, f.TargetHost, f.TargetPort, f.MaxConnections, f.Timeout, rateLimitLog)
+
 	maxConnsStr := "unlimited"
 	if f.MaxConnections > 0 {
 		maxConnsStr = fmt.Sprintf("%d", f.MaxConnections)
 	}
-	logging.Logger.Infof("TCP Forwarder: [%s] Listening on %s, forwarding to %s. Max Connections: %s. Timeout: %s",
-		f.RuleDesc, listenAddr, targetAddr, maxConnsStr, f.Timeout.String())
-
 
 	go func() {
 		for {
-			clientConn, err := f.listener.Accept()
-			if err != nil {
-				if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-					logging.Logger.Infof("TCP Listener for rule '%s' (on %s) closed.", f.RuleDesc, listenAddr)
+			clientConn, errAccept := f.listener.Accept()
+			if errAccept != nil {
+				if opErr, ok := errAccept.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+					logging.S.Infof("TCP Listener for rule '%s' (on %s) closed.", f.RuleDesc, listenAddrStr)
 					return
 				}
-				logging.Logger.Errorf("Failed to accept TCP connection for rule '%s' on %s: %v", f.RuleDesc, listenAddr, err)
+				logging.S.Errorf("TCP: [%s] Failed to accept connection on %s: %v", f.RuleDesc, listenAddrStr, errAccept)
 				if clientConn != nil {
 					clientConn.Close()
 				}
 				continue
 			}
 
-			// Check connection limit
 			if f.MaxConnections > 0 {
 				currentConns := atomic.LoadInt64(&f.activeConnections)
 				if currentConns >= int64(f.MaxConnections) {
-					logging.Logger.Warnf("TCP: [%s] Max connections (%d) reached. Rejecting new connection from %s", f.RuleDesc, f.MaxConnections, clientConn.RemoteAddr())
+					logging.S.Warnf("TCP: [%s] Max connections (%d) reached. Rejecting new connection from %s", f.RuleDesc, f.MaxConnections, clientConn.RemoteAddr())
 					clientConn.Close()
 					continue
 				}
 			}
 
 			atomic.AddInt64(&f.activeConnections, 1)
-			// logging.Logger.Debugf("TCP: [%s] New connection from %s. Active connections: %d/%s", f.RuleDesc, clientConn.RemoteAddr(), atomic.LoadInt64(&f.activeConnections), maxConnsStr)
-			go f.handleTCPConnection(clientConn) // Pass only clientConn
+			logging.S.Debugf("TCP: [%s] New connection from %s. Active: %d/%s", f.RuleDesc, clientConn.RemoteAddr(), atomic.LoadInt64(&f.activeConnections), maxConnsStr)
+			go f.handleTCPConnection(clientConn)
 		}
 	}()
 	return nil
 }
 
-// handleTCPConnection forwards data between the client and the configured target.
+func customCopyWithRateLimit(dst net.Conn, src net.Conn, bucket *ratelimit.TokenBucket, effectiveTimeout time.Duration, ruleDesc string, direction string, errChan chan error, connClosedChan chan struct{}) {
+	buf := make([]byte, copyBufferSize)
+	var totalBytesCopied int64
+	var lastActivityTime time.Time = time.Now() // Track activity for timeout during bucket wait
+
+	defer func() {
+		if tcpDst, ok := dst.(*net.TCPConn); ok {
+			tcpDst.CloseWrite()
+		}
+		logging.S.Debugf("TCP: [%s] Finished %s copy, total bytes: %d", ruleDesc, direction, totalBytesCopied)
+		// errChan is signaled explicitly based on outcome
+	}()
+
+	for {
+		select {
+		case <-connClosedChan:
+			logging.S.Debugf("TCP: [%s] %s copy: Connection closing signal received, aborting copy.", ruleDesc, direction)
+			errChan <- io.ErrClosedPipe
+			return
+		default:
+		}
+
+		if effectiveTimeout > 0 {
+			src.SetReadDeadline(time.Now().Add(effectiveTimeout))
+		}
+		readN, readErr := src.Read(buf)
+		if effectiveTimeout > 0 {
+			src.SetReadDeadline(time.Time{})
+		}
+
+		if readN > 0 {
+			lastActivityTime = time.Now()
+			if bucket != nil {
+				needed := readN
+				for !bucket.Consume(needed) {
+					logging.S.Debugf("TCP: [%s] %s bucket empty (need %d, have ~%.0f), delaying for %v", ruleDesc, direction, needed, bucket.CurrentTokens(), bucketRetryDelay)
+					select {
+					case <-time.After(bucketRetryDelay):
+					case <-connClosedChan:
+						logging.S.Debugf("TCP: [%s] %s copy: Connection closing signal received during bucket delay.", ruleDesc, direction)
+						errChan <- io.ErrClosedPipe
+						return
+					}
+					if effectiveTimeout > 0 && time.Since(lastActivityTime) > effectiveTimeout {
+						 logging.S.Warnf("TCP: [%s] %s copy: Timeout (%s) exceeded while waiting for token bucket.", ruleDesc, direction, effectiveTimeout)
+                         errChan <- contextDeadlineExceededError{}
+                         return
+					}
+				}
+			}
+
+			if effectiveTimeout > 0 {
+				dst.SetWriteDeadline(time.Now().Add(effectiveTimeout))
+			}
+			writeN, writeErr := dst.Write(buf[:readN])
+			if effectiveTimeout > 0 {
+				dst.SetWriteDeadline(time.Time{})
+			}
+
+			if writeErr != nil {
+				logging.S.Warnf("TCP: [%s] Error writing %s data to %s from %s: %v", ruleDesc, direction, dst.RemoteAddr(), src.RemoteAddr(), writeErr)
+				errChan <- writeErr
+				return
+			}
+			if readN != writeN {
+				logging.S.Warnf("TCP: [%s] Short write %s to %s from %s: read %d, wrote %d", ruleDesc, direction, dst.RemoteAddr(), src.RemoteAddr(), readN, writeN)
+				errChan <- io.ErrShortWrite
+				return
+			}
+			totalBytesCopied += int64(writeN)
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				logging.S.Debugf("TCP: [%s] EOF reached on %s read from %s.", ruleDesc, direction, src.RemoteAddr())
+				errChan <- nil
+			} else {
+				if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+					logging.S.Warnf("TCP: [%s] Timeout reading %s data from %s: %v", ruleDesc, direction, src.RemoteAddr(), readErr)
+				} else if readErr != io.ErrClosedPipe && !strings.Contains(readErr.Error(), "use of closed network connection"){
+					logging.S.Warnf("TCP: [%s] Error reading %s data from %s: %v", ruleDesc, direction, src.RemoteAddr(), readErr)
+                } else {
+                    logging.S.Debugf("TCP: [%s] Read loop ended for %s from %s due to closed pipe/connection: %v", ruleDesc, direction, src.RemoteAddr(), readErr)
+                }
+				errChan <- readErr
+			}
+			return
+		}
+	}
+}
+
 func (f *TCPForwarder) handleTCPConnection(clientConn net.Conn) {
-	targetAddr := fmt.Sprintf("%s:%d", f.TargetHost, f.TargetPort)
+	maxConnsStr := "unlimited"
+	if f.MaxConnections > 0 {
+		maxConnsStr = fmt.Sprintf("%d", f.MaxConnections)
+	}
+	closedEarly := false
+
 	defer func() {
 		atomic.AddInt64(&f.activeConnections, -1)
-		// logging.Logger.Debugf("TCP: [%s] Connection closed from %s. Active connections: %d/%s", f.RuleDesc, clientConn.RemoteAddr(), atomic.LoadInt64(&f.activeConnections), maxConnsStr)
+		if closedEarly {
+		    logging.S.Debugf("TCP: [%s] Conn from %s closed early. Active: %d/%s", f.RuleDesc, clientConn.RemoteAddr(), atomic.LoadInt64(&f.activeConnections), maxConnsStr)
+		} else {
+		    logging.S.Debugf("TCP: [%s] Conn from %s fully closed. Active: %d/%s", f.RuleDesc, clientConn.RemoteAddr(), atomic.LoadInt64(&f.activeConnections), maxConnsStr)
+		}
 		clientConn.Close()
 	}()
 
-	logging.Logger.Debugf("TCP: [%s] Handling connection from %s to target %s", f.RuleDesc, clientConn.RemoteAddr(), targetAddr)
-	targetConn, err := net.DialTimeout("tcp", targetAddr, f.Timeout) // Use DialTimeout
-	if err != nil {
-		logging.Logger.Errorf("TCP: [%s] Failed to connect to target %s (client %s): %v", f.RuleDesc, targetAddr, clientConn.RemoteAddr(), err)
-		return
+	var targetConn net.Conn
+	var errDial error
+	targetAddrStr := fmt.Sprintf("%s:%d", f.TargetHost, f.TargetPort)
+
+	for i := 0; i < maxDialRetries; i++ {
+		logging.S.Debugf("TCP: [%s] Attempting to connect to target %s (attempt %d/%d, timeout %s)", f.RuleDesc, targetAddrStr, i+1, maxDialRetries, dialAttemptTimeout)
+		targetConn, errDial = net.DialTimeout("tcp", targetAddrStr, dialAttemptTimeout)
+		if errDial == nil {
+			break // Connection successful
+		}
+		logging.S.Warnf("TCP: [%s] Failed to connect to target %s (attempt %d/%d): %v.", f.RuleDesc, targetAddrStr, i+1, maxDialRetries, errDial)
+		if i < maxDialRetries-1 {
+			logging.S.Infof("TCP: [%s] Retrying target connection to %s in %v...", f.RuleDesc, targetAddrStr, dialRetryDelay)
+			time.Sleep(dialRetryDelay)
+		}
 	}
+
+	if errDial != nil {
+		logging.S.Errorf("TCP: [%s] Failed to connect to target %s after %d attempts: %v. Closing client connection %s.",
+			f.RuleDesc, targetAddrStr, maxDialRetries, errDial, clientConn.RemoteAddr())
+		closedEarly = true
 		return
 	}
 	defer targetConn.Close()
 
-	logging.Logger.Debugf("TCP: [%s] Established connection from %s to target %s", f.RuleDesc, clientConn.RemoteAddr(), targetAddr)
-
-	// Timeout for io.Copy can be handled by setting deadlines on connections if f.Timeout > 0
-	// This is a more complex implementation involving selecting on multiple channels or using context.
-	// For now, io.Copy will run until EOF or an error. The DialTimeout handles initial connection timeout.
-	// If f.Timeout is meant to be an inactivity timeout, that requires setting Read/Write deadlines
-	// before each Read/Write operation, which is intricate.
-
-	errChan := make(chan error, 2)
-
-	// Bidirectional copy
-	go func() {
-		// logging.Logger.Debugf("TCP: [%s] Starting copy from client %s to target %s", f.RuleDesc, clientConn.RemoteAddr(), targetAddr)
-		_, errCopy := io.Copy(targetConn, clientConn)
-		// logging.Logger.Debugf("TCP: [%s] Finished copy from client %s to target %s, err: %v", f.RuleDesc, clientConn.RemoteAddr(), targetAddr, errCopy)
-		errChan <- errCopy
-		if tcpTargetConn, ok := targetConn.(*net.TCPConn); ok {
-			tcpTargetConn.CloseWrite()
-		}
-	}()
-
-	go func() {
-		// logging.Logger.Debugf("TCP: [%s] Starting copy from target %s to client %s", f.RuleDesc, targetAddr, clientConn.RemoteAddr())
-		_, errCopy := io.Copy(clientConn, targetConn)
-		// logging.Logger.Debugf("TCP: [%s] Finished copy from target %s to client %s, err: %v", f.RuleDesc, targetAddr, clientConn.RemoteAddr(), errCopy)
-		errChan <- errCopy
-		if tcpClientConn, ok := clientConn.(*net.TCPConn); ok {
-			tcpClientConn.CloseWrite()
-		}
-	}()
-
-	for i := 0; i < 2; i++ {
-		if errCopy := <-errChan; errCopy != nil {
-			// Avoid logging EOF or "use of closed network connection" as errors, they are normal.
-			if errCopy != io.EOF && !strings.Contains(errCopy.Error(), "use of closed network connection") {
-				logging.Logger.Warnf("TCP: [%s] Error during data copy between client %s and target %s: %v", f.RuleDesc, clientConn.RemoteAddr(), targetAddr, errCopy)
-			}
+	logging.S.Infof("TCP: [%s] Accepted connection from %s, successfully connected to target %s", f.RuleDesc, clientConn.RemoteAddr(), targetAddrStr)
+	if f.bandwidthSettings.IsSet {
+		if f.bandwidthSettings.RateBPS > 0 {
+			logging.S.Infof("TCP: [%s] Applying bandwidth limit - Rate: %.2f Bps, Burst: %.2f Bps (per direction)", f.RuleDesc, f.bandwidthSettings.RateBPS, f.bandwidthSettings.BurstBPS)
+		} else {
+			logging.S.Infof("TCP: [%s] Bandwidth is explicitly unlimited for this rule.", f.RuleDesc)
 		}
 	}
-	// logging.Logger.Debugf("TCP: [%s] Bidirectional copy finished for client %s, target %s", f.RuleDesc, clientConn.RemoteAddr(), targetAddr)
+
+	connClosedChan := make(chan struct{})
+	errChan := make(chan error, 2)
+	copyTimeout := f.Timeout
+
+	go customCopyWithRateLimit(targetConn, clientConn, f.ingressBucket, copyTimeout, f.RuleDesc, "client->target", errChan, connClosedChan)
+	go customCopyWithRateLimit(clientConn, targetConn, f.egressBucket, copyTimeout, f.RuleDesc, "target->client", errChan, connClosedChan)
+
+	completedCopies := 0
+	for i := 0; i < 2; i++ {
+		select {
+		case copyErr := <-errChan:
+			if copyErr != nil {
+				if netErr, ok := copyErr.(net.Error); ok && netErr.Timeout() {
+					logging.S.Warnf("TCP: [%s] Connection %s <-> %s timed out during copy: %v", f.RuleDesc, clientConn.RemoteAddr(), targetAddrStr, copyErr)
+				} else if copyErr != io.EOF && copyErr != io.ErrClosedPipe && !strings.Contains(copyErr.Error(), "use of closed network connection") && !strings.Contains(copyErr.Error(), "broken pipe") {
+					logging.S.Debugf("TCP: [%s] Error during copy for %s <-> %s: %v", f.RuleDesc, clientConn.RemoteAddr(), targetAddrStr, copyErr)
+				} else {
+                     logging.S.Debugf("TCP: [%s] Copy routine for %s finished with expected EOF/close: %v", f.RuleDesc, clientConn.RemoteAddr(), copyErr)
+                }
+			}
+		// Optional: Add a timeout here for waiting on errChan if copy routines could get stuck indefinitely without erroring.
+		// case <-time.After(someOverallCopyTimeout):
+		//    logging.S.Errorf("TCP: [%s] Overall copy timeout for %s", f.RuleDesc, clientConn.RemoteAddr())
+		//    close(connClosedChan) // Forcefully signal copy routines
+		//    return // Exit handler
+		}
+		completedCopies++
+	}
+
+	// Both copy goroutines have finished (either cleanly or with an error signaled on errChan).
+	// Signal them to stop if they are somehow stuck in bucket retry loop waiting on connClosedChan.
+	close(connClosedChan)
+
+	logging.S.Debugf("TCP: [%s] Both copy routines finished for %s", f.RuleDesc, clientConn.RemoteAddr())
 }
 
-// Stop closes the listener.
 func (f *TCPForwarder) Stop() error {
 	if f.listener != nil {
-		originalListenAddr := f.listener.Addr().String() // Get address before closing
-		logging.Logger.Infof("Stopping TCP forwarder for rule '%s' (listening on %s, target %s:%d)", f.RuleDesc, originalListenAddr, f.TargetHost, f.TargetPort)
+		originalListenAddr := f.listener.Addr().String()
+		logging.S.Infof("Stopping TCP forwarder for rule '%s' (listening on %s, target %s:%d)", f.RuleDesc, originalListenAddr, f.TargetHost, f.TargetPort)
 		err := f.listener.Close()
-		f.listener = nil // Mark as nil to prevent further operations
+		f.listener = nil
 		if err != nil {
-			logging.Logger.Errorf("Error while stopping TCP forwarder for rule '%s' (listening on %s): %v", f.RuleDesc, originalListenAddr, err)
+			logging.S.Errorf("Error while stopping TCP forwarder for rule '%s' (listening on %s): %v", f.RuleDesc, originalListenAddr, err)
 			return err
 		}
-		logging.Logger.Infof("Successfully stopped TCP forwarder for rule '%s' (was listening on %s)", f.RuleDesc, originalListenAddr)
+		logging.S.Infof("Successfully stopped TCP forwarder for rule '%s' (was listening on %s)", f.RuleDesc, originalListenAddr)
 		return nil
 	}
-	// logging.Logger.Debugf("TCP forwarder for rule '%s' (target %s:%d) already stopped or never started.", f.RuleDesc, f.TargetHost, f.TargetPort)
+	logging.S.Debugf("TCP forwarder for rule '%s' (target %s:%d) already stopped or never started.", f.RuleDesc, f.TargetHost, f.TargetPort)
 	return nil
 }
